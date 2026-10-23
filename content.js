@@ -43,13 +43,33 @@
     }
   }
 
+  // Пределы скорости больше не настраиваются пользователем
+  const MIN_SPEED = 0.1;
+  const MAX_SPEED = 16.0;
+  // Максимальное усиление громкости (3.0 = 300%)
+  const MAX_VOLUME_BOOST = 3.0;
+
+  // Встроенные шрифты. Список должен совпадать со списком в popup.js
+  const BUILTIN_FONTS = {
+    system: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
+    arial: "Arial, Helvetica, sans-serif",
+    verdana: "Verdana, Geneva, sans-serif",
+    tahoma: "Tahoma, Geneva, sans-serif",
+    trebuchet: "'Trebuchet MS', Helvetica, sans-serif",
+    georgia: "Georgia, 'Times New Roman', serif",
+    times: "'Times New Roman', Times, serif",
+    mono: "Consolas, Monaco, 'Courier New', monospace",
+    courier: "'Courier New', Courier, monospace"
+  };
+
   const defaultSettings = {
     showIndicatorOnLoad: false,
     speedStep: 0.1,
-    minSpeed: 0.1,
-    maxSpeed: 16.0,
+    resetSpeed: 1.0,
     rewindBackSec: 10,
     rewindForwardSec: 10,
+    undoRewindCombo: { ctrl: true, shift: false, alt: false, code: 'KeyZ' },
+    undoRewindDelaySec: 2,
     directInputCombo: { ctrl: true, shift: true, alt: false, code: '' },
     codeRewindBack: 'KeyJ',
     codeRewindForward: 'KeyL',
@@ -62,10 +82,12 @@
     textColor: '#ffffff',
     bgColorRgba: 'rgba(0, 0, 0, 0.85)',
     fontSize: 16,
+    fontFamily: 'default',
     posNormal: 'top-center',
     posFullscreen: 'top-center',
     blacklist: [],
-    siteSpeeds: {}
+    siteSpeeds: {},
+    siteVolumes: {}
   };
 
   let settings = await getStorageData(defaultSettings);
@@ -92,6 +114,42 @@
       speeds[currentHost] = speed;
       setStorageData({ siteSpeeds: speeds });
     });
+  }
+
+  // До какой скорости сбрасывает Ctrl + ЛКМ (настраивается в popup)
+  function getResetSpeed() {
+    const value = parseFloat(settings.resetSpeed);
+    return isFinite(value) && value > 0 ? value : 1.0;
+  }
+
+  // Усиление громкости хранится отдельно для каждого сайта: 1.0 = 100%, 3.0 = 300%
+  function getSavedVolumeBoost() {
+    const value = parseFloat(settings.siteVolumes?.[currentHost]);
+    if (!isFinite(value)) return 1.0;
+    return Math.min(MAX_VOLUME_BOOST, Math.max(1.0, value));
+  }
+
+  let volumeSaveTimer = null;
+  let volumeSavePending = false;
+
+  function saveVolumeBoost(boost) {
+    const siteVolumes = { ...(settings.siteVolumes || {}) };
+    if (boost > 1) siteVolumes[currentHost] = boost;
+    else delete siteVolumes[currentHost];
+    settings.siteVolumes = siteVolumes;
+
+    // Ползунок шлёт много значений подряд, поэтому в хранилище пишем только последнее
+    volumeSavePending = true;
+    clearTimeout(volumeSaveTimer);
+    volumeSaveTimer = setTimeout(() => {
+      volumeSavePending = false;
+      getStorageData({ siteVolumes: {} }).then((data) => {
+        const volumes = data.siteVolumes || {};
+        if (boost > 1) volumes[currentHost] = boost;
+        else delete volumes[currentHost];
+        setStorageData({ siteVolumes: volumes });
+      });
+    }, 300);
   }
 
   let isInternalSettingRate = false;
@@ -146,6 +204,10 @@
 
   let rewindAccumulator = 0;
   let rewindTimeout = null;
+
+  // Отмена перемотки: позиция, с которой началась серия перемоток
+  let undoState = null; // { media, time, src }
+  let undoTimer = null;
 
   let isTimecodeInputActive = false;
   let timecodeBuffer = "";
@@ -258,24 +320,298 @@
     return allMedia[0];
   }
 
+  // ===== Усиление громкости (Web Audio API) =====
+  // Штатная громкость <video> ограничена 100%, поэтому звук пропускаем через GainNode.
+  // DynamicsCompressor сам добавляет компенсирующее усиление (makeup gain). Считаем его по формуле
+  // из спецификации Web Audio и вычитаем из GainNode, чтобы 250% на ползунке давало ровно ×2.5.
+  const LIMITER_THRESHOLD_DB = -2;
+  const LIMITER_RATIO = 20;
+  const LIMITER_MAKEUP = Math.pow(
+    1 / Math.pow(10, (LIMITER_THRESHOLD_DB + (0 - LIMITER_THRESHOLD_DB) / LIMITER_RATIO) / 20),
+    0.6
+  );
+
+  let audioCtx = null;
+  const audioGraphs = new WeakMap(); // media -> { source, gain, limiter }
+  const unsupportedMedia = new WeakSet(); // элементы, которые не удалось подключить
+
+  function getAudioContext() {
+    if (audioCtx && audioCtx.state !== 'closed') return audioCtx;
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return null;
+    try {
+      audioCtx = new AudioContextClass();
+      // Браузер запускает контекст только после действия пользователя на странице.
+      // Пока контекст не запущен, видео мы не трогаем, поэтому звук не пропадает.
+      audioCtx.onstatechange = () => {
+        if (audioCtx && audioCtx.state === 'running') applyVolumeBoostToAll();
+      };
+    } catch (e) {
+      audioCtx = null;
+    }
+    return audioCtx;
+  }
+
+  function resumeAudioContext() {
+    if (audioCtx && audioCtx.state === 'suspended') {
+      audioCtx.resume().catch(() => {});
+    }
+  }
+
+  ['pointerdown', 'keydown', 'touchend', 'click'].forEach((evt) => {
+    window.addEventListener(evt, resumeAudioContext, { capture: true, passive: true });
+  });
+
+  // true — усилить можно, false — нельзя, null — пока неизвестно (источник ещё не загружен)
+  function getBoostSupport(media) {
+    try {
+      // Видео с защитой (DRM/EME) после подключения к Web Audio теряет звук
+      if (media.mediaKeys) return false;
+      if (media.srcObject) return true;
+      const src = media.currentSrc;
+      if (!src) return null;
+      if (/^(blob|data):/i.test(src)) return true;
+      // Чужой источник без CORS Web Audio превращает в тишину
+      if (media.crossOrigin !== null) return true;
+      const url = new URL(src, location.href);
+      if (url.protocol === 'file:') return false;
+      return url.origin === (window.origin || location.origin);
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function createAudioGraph(media, ctx) {
+    let source;
+    try {
+      source = ctx.createMediaElementSource(media);
+    } catch (e) {
+      // Страница уже подключила этот элемент к своему AudioContext
+      unsupportedMedia.add(media);
+      return null;
+    }
+
+    try {
+      const gain = ctx.createGain();
+      // Лимитер не даёт звуку хрипеть, когда усиленный сигнал выходит за 0 дБ
+      const limiter = ctx.createDynamicsCompressor();
+      limiter.threshold.value = LIMITER_THRESHOLD_DB;
+      limiter.knee.value = 0;
+      limiter.ratio.value = 1;
+      limiter.attack.value = 0.003;
+      limiter.release.value = 0.15;
+
+      source.connect(gain);
+      gain.connect(limiter);
+      limiter.connect(ctx.destination);
+
+      const graph = { source, gain, limiter };
+      audioGraphs.set(media, graph);
+      return graph;
+    } catch (e) {
+      try { source.connect(ctx.destination); } catch (err) { /* ignore */ }
+      unsupportedMedia.add(media);
+      return null;
+    }
+  }
+
+  function setGraphBoost(graph, boost) {
+    if (!audioCtx) return;
+    const now = audioCtx.currentTime;
+    const gainParam = graph.gain.gain;
+    // На 100% лимитер выключен (ratio 1): звук проходит без изменений
+    const limiting = boost > 1;
+    gainParam.cancelScheduledValues(now);
+    gainParam.setValueAtTime(gainParam.value, now);
+    gainParam.linearRampToValueAtTime(limiting ? boost / LIMITER_MAKEUP : boost, now + 0.05);
+    graph.limiter.ratio.setValueAtTime(limiting ? LIMITER_RATIO : 1, now);
+  }
+
+  function applyVolumeBoost(media) {
+    if (!media) return;
+    const boost = isFeatureDisabled('volume') ? 1.0 : getSavedVolumeBoost();
+    let graph = audioGraphs.get(media);
+
+    if (!graph) {
+      // Пока усиления нет, к видео вообще не прикасаемся
+      if (boost <= 1 || unsupportedMedia.has(media)) return;
+
+      // null — источник ещё не загружен (повторим по событию), false — усилить нельзя
+      if (getBoostSupport(media) !== true) return;
+
+      const ctx = getAudioContext();
+      if (!ctx) return;
+      if (ctx.state !== 'running') {
+        ctx.resume().catch(() => {}); // дальше сработает onstatechange
+        return;
+      }
+
+      graph = createAudioGraph(media, ctx);
+      if (!graph) return;
+    }
+
+    setGraphBoost(graph, boost);
+  }
+
+  function applyVolumeBoostToAll() {
+    getAllMediaDeep(document).forEach(applyVolumeBoost);
+  }
+
+  // 'ok' | 'pending' (ждём действия на странице) | 'unsupported' | 'disabled'
+  function getVolumeStatus(media) {
+    if (isFeatureDisabled('volume')) return 'disabled';
+    if (!media) return 'ok';
+    if (unsupportedMedia.has(media) || getBoostSupport(media) === false) return 'unsupported';
+    if (getSavedVolumeBoost() > 1 && !audioGraphs.has(media)) return 'pending';
+    return 'ok';
+  }
+
+  function setVolumeBoost(rawBoost, media) {
+    if (isFeatureDisabled('volume')) return;
+    const parsed = parseFloat(rawBoost);
+    if (!isFinite(parsed)) return;
+
+    const boost = Math.round(Math.min(MAX_VOLUME_BOOST, Math.max(1, parsed)) * 100) / 100;
+    saveVolumeBoost(boost);
+    applyVolumeBoostToAll();
+
+    const percent = `${Math.round(boost * 100)}%`;
+    const status = boost > 1 ? getVolumeStatus(media) : 'ok';
+    if (status === 'unsupported') {
+      showIndicator('Усиление недоступно для этого видео');
+    } else if (status === 'pending') {
+      showIndicator(`Громкость: ${percent} (кликните по странице)`);
+    } else {
+      showIndicator(`Громкость: ${percent}`);
+    }
+  }
+
+  // ===== Шрифт плашек =====
+  const loadedCustomFonts = new Map(); // id -> FontFace | 'loading' | 'failed'
+
+  function customFontFamilyName(id) {
+    return 'OverclockFont_' + String(id).replace(/[^a-zA-Z0-9_-]/g, '');
+  }
+
+  function base64ToArrayBuffer(base64) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+
+  // Свой шрифт подключаем через FontFace API из бинарных данных: так его не блокирует CSP сайта
+  async function loadCustomFont(id) {
+    if (!id || loadedCustomFonts.has(id)) return;
+    loadedCustomFonts.set(id, 'loading');
+    try {
+      const key = `customFont_${id}`;
+      const data = await getStorageData({ [key]: '' });
+      if (!data[key]) throw new Error('font not found');
+      // weight 100-900 — чтобы браузер не делал "жирную" копию поверх файла шрифта
+      const face = new FontFace(customFontFamilyName(id), base64ToArrayBuffer(data[key]), { weight: '100 900' });
+      await face.load();
+      document.fonts.add(face);
+      loadedCustomFonts.set(id, face);
+    } catch (e) {
+      loadedCustomFonts.set(id, 'failed');
+    }
+  }
+
+  function unloadCustomFont(id) {
+    const face = loadedCustomFonts.get(id);
+    if (face && typeof face === 'object') {
+      try { document.fonts.delete(face); } catch (e) { /* ignore */ }
+    }
+    loadedCustomFonts.delete(id);
+  }
+
+  function preloadOverlayFont() {
+    const id = typeof settings.fontFamily === 'string' ? settings.fontFamily : '';
+    if (id.startsWith('custom:')) loadCustomFont(id.slice(7));
+  }
+
+  // defaultStack — шрифт плашки "по умолчанию" (у каждой плашки он свой)
+  function getOverlayFontFamily(defaultStack) {
+    const id = typeof settings.fontFamily === 'string' ? settings.fontFamily : 'default';
+    if (id.startsWith('custom:')) {
+      const fontId = id.slice(7);
+      loadCustomFont(fontId);
+      return `"${customFontFamilyName(fontId)}", ${defaultStack}`;
+    }
+    if (Object.prototype.hasOwnProperty.call(BUILTIN_FONTS, id)) return BUILTIN_FONTS[id];
+    return defaultStack;
+  }
+
   if (isExtensionValid()) {
     try {
       chrome.storage?.onChanged?.addListener((changes) => {
         if (!isExtensionValid()) return;
         for (const key in changes) {
+          // Файлы шрифтов большие: в settings их не копируем
+          if (key.startsWith('customFont_')) {
+            unloadCustomFont(key.slice('customFont_'.length));
+            continue;
+          }
+          if (key === 'customFontsMeta') continue;
+          // Пока не записано наше последнее значение громкости, чужое не применяем
+          if (key === 'siteVolumes' && volumeSavePending) continue;
           settings[key] = changes[key].newValue;
         }
+
+        // Усиление для этого сайта поменяли в другой вкладке или переключили чёрный список
+        let volumeChanged = !!changes.blacklist;
+        if (changes.siteVolumes && !volumeSavePending) {
+          const oldBoost = changes.siteVolumes.oldValue?.[currentHost];
+          const newBoost = changes.siteVolumes.newValue?.[currentHost];
+          if (oldBoost !== newBoost) volumeChanged = true;
+        }
+        if (volumeChanged) applyVolumeBoostToAll();
       });
     } catch (e) {}
 
     try {
-      chrome.runtime?.onMessage?.addListener((request) => {
-        if (!isExtensionValid()) return;
-        if (request.action === 'setSpeed' && !isFeatureDisabled('speed')) {
+      chrome.runtime?.onMessage?.addListener((request, sender, sendResponse) => {
+        if (!isExtensionValid() || !request) return;
+
+        // Состояние страницы для popup. Отвечает фрейм, в котором есть видео
+        if (request.action === 'getState') {
           const media = getActiveMedia();
-          if (media) {
+          if (!media) return;
+
+          const state = {
+            host: currentHost,
+            speed: media.playbackRate,
+            volumeBoost: getSavedVolumeBoost(),
+            volumeStatus: getVolumeStatus(media)
+          };
+
+          if (!media.paused) {
+            sendResponse(state);
+            return;
+          }
+          // Фреймы с играющим видео отвечают раньше фреймов с видео на паузе
+          setTimeout(() => {
+            try { sendResponse(state); } catch (e) { /* ignore */ }
+          }, 150);
+          return true;
+        }
+
+        if (request.action === 'setSpeed') {
+          const media = getActiveMedia();
+          if (!media) return;
+          if (!isFeatureDisabled('speed')) {
             setMediaSpeed(media, request.speed, true);
           }
+          sendResponse({ speed: media.playbackRate });
+          return;
+        }
+
+        if (request.action === 'setVolumeBoost') {
+          const media = getActiveMedia();
+          if (!media) return;
+          setVolumeBoost(request.boost, media);
+          sendResponse({ volumeBoost: getSavedVolumeBoost(), volumeStatus: getVolumeStatus(media) });
         }
       });
     } catch (e) {}
@@ -343,7 +679,7 @@
       padding: '8px 16px',
       borderRadius: '8px',
       fontWeight: 'bold',
-      fontFamily: 'monospace, sans-serif',
+      fontFamily: getOverlayFontFamily('monospace, sans-serif'),
       zIndex: '2147483647',
       pointerEvents: 'none',
       transition: 'opacity 0.2s ease',
@@ -387,7 +723,7 @@
       color: '#ffffff',
       fontSize: '42px',
       fontWeight: '800',
-      fontFamily: 'system-ui, sans-serif',
+      fontFamily: getOverlayFontFamily('system-ui, sans-serif'),
       padding: '20px 36px',
       borderRadius: '40px',
       zIndex: '2147483647',
@@ -411,6 +747,68 @@
     }, 900);
   }
 
+  // ===== Отмена перемотки =====
+  function getUndoWindowMs() {
+    const sec = parseFloat(settings.undoRewindDelaySec);
+    if (!isFinite(sec) || sec <= 0) return 0;
+    return Math.min(sec, 30) * 1000;
+  }
+
+  function clearUndoState() {
+    undoState = null;
+    clearTimeout(undoTimer);
+    undoTimer = null;
+  }
+
+  // Запоминаем позицию ДО перемотки. Если перемоток несколько подряд (каждая в пределах
+  // окна отмены), откат вернёт позицию, с которой началась вся серия.
+  function recordUndoPoint(media) {
+    const windowMs = getUndoWindowMs();
+    if (!windowMs) {
+      clearUndoState();
+      return;
+    }
+    if (!undoState || undoState.media !== media) {
+      undoState = { media, time: media.currentTime, src: media.currentSrc };
+    }
+    clearTimeout(undoTimer);
+    undoTimer = setTimeout(clearUndoState, windowMs);
+  }
+
+  // Любая перемотка расширения (J/L, цифры, кадры, таймкод) идёт через эту функцию
+  function seekTo(media, time) {
+    recordUndoPoint(media);
+    media.currentTime = time;
+  }
+
+  function undoLastSeek() {
+    const state = undoState;
+    clearUndoState();
+    if (!state || !state.media || !state.media.isConnected) return false;
+    if (state.media.currentSrc !== state.src) return false; // видео уже другое
+
+    try {
+      state.media.currentTime = state.time;
+    } catch (e) {
+      return false;
+    }
+
+    rewindAccumulator = 0;
+    clearTimeout(rewindTimeout);
+    const overlay = document.getElementById('custom-rewind-overlay');
+    if (overlay) overlay.style.opacity = '0';
+
+    showIndicator('Перемотка отменена');
+    return true;
+  }
+
+  // Сочетание отмены с клавиатурой (мышиные кнопки обрабатываются в handleMouseHotkey)
+  function matchesUndoCombo(e) {
+    const combo = settings.undoRewindCombo;
+    if (!combo || typeof combo !== 'object' || !combo.code || combo.code.startsWith('Mouse')) return false;
+    return matchesCombo(e, combo);
+  }
+
   function handleRewind(media, seconds, direction) {
     if (!media || isFeatureDisabled('rewind')) return;
 
@@ -424,9 +822,9 @@
     const duration = getMediaDuration(media);
 
     if (direction === 'forward') {
-      media.currentTime = Math.min(duration || Infinity, media.currentTime + seconds);
+      seekTo(media, Math.min(duration || Infinity, media.currentTime + seconds));
     } else {
-      media.currentTime = Math.max(0, media.currentTime - seconds);
+      seekTo(media, Math.max(0, media.currentTime - seconds));
     }
 
     const displaySec = Math.abs(rewindAccumulator);
@@ -509,7 +907,8 @@
       color: '#ffffff',
       fontSize: '28px',
       fontWeight: 'bold',
-      fontFamily: 'Consolas, Monaco, monospace',
+      fontFamily: getOverlayFontFamily('Consolas, Monaco, monospace'),
+      fontVariantNumeric: 'tabular-nums',
       padding: '10px 24px',
       borderRadius: '12px',
       zIndex: '2147483647',
@@ -535,12 +934,12 @@
   }
 
   function setMediaSpeed(media, newSpeed, showUI = false) {
-    if (isFeatureDisabled('speed')) return;
+    if (isFeatureDisabled('speed')) return null;
 
-    const minS = 0.1;
-    const maxS = 16.0;
+    const parsedSpeed = parseFloat(newSpeed);
+    if (!isFinite(parsedSpeed)) return null;
 
-    let clampedSpeed = Math.min(maxS, Math.max(minS, parseFloat(newSpeed)));
+    let clampedSpeed = Math.min(MAX_SPEED, Math.max(MIN_SPEED, parsedSpeed));
     clampedSpeed = Math.round(clampedSpeed * 100) / 100;
 
     forceSetSpeed(media, clampedSpeed);
@@ -550,11 +949,22 @@
       const pauseLabel = media.paused ? ' (Пауза)' : '';
       showIndicator(`${clampedSpeed.toFixed(2)}x${pauseLabel}`);
     }
+
+    return clampedSpeed;
   }
 
   function attachMediaListeners(media) {
     if (media.dataset.speedControlAttached) return;
     media.dataset.speedControlAttached = "true";
+
+    preloadOverlayFont();
+
+    // Усиление громкости работает независимо от того, отключена ли на сайте скорость
+    const syncVolume = () => applyVolumeBoost(media);
+    ['loadstart', 'loadedmetadata', 'canplay', 'play', 'playing'].forEach(evt => {
+      media.addEventListener(evt, syncVolume, true);
+    });
+    syncVolume();
 
     if (isFeatureDisabled('speed')) return;
 
@@ -617,7 +1027,7 @@
       e.stopPropagation();
 
       let currentRate = media.playbackRate;
-      const step = parseFloat(settings.speedStep);
+      const step = parseFloat(settings.speedStep) || 0.1;
 
       if (e.deltaY < 0) {
         currentRate += step;
@@ -637,7 +1047,7 @@
       e.preventDefault();
       e.stopPropagation();
 
-      setMediaSpeed(media, 1.0, true);
+      setMediaSpeed(media, getResetSpeed(), true);
     }
   }, true);
 
@@ -731,7 +1141,7 @@
       if (media) {
         const duration = getMediaDuration(media);
         const targetTime = duration > 0 ? Math.min(duration, totalSec) : totalSec;
-        media.currentTime = targetTime;
+        seekTo(media, targetTime);
 
         const hrs = Math.floor(targetTime / 3600);
         const mins = Math.floor((targetTime % 3600) / 60);
@@ -756,6 +1166,18 @@
 
     const mouseCode = 'Mouse' + e.button;
     const { backSec, fwdSec } = getRewindSecs();
+
+    // Отмена перемотки кнопкой мыши (перехватываем только пока отмена доступна)
+    const undoCombo = settings.undoRewindCombo;
+    if (
+      undoState && undoCombo && undoCombo.code === mouseCode && !isFeatureDisabled('rewind') &&
+      !!undoCombo.ctrl === e.ctrlKey && !!undoCombo.shift === e.shiftKey && !!undoCombo.alt === e.altKey
+    ) {
+      e.preventDefault();
+      e.stopPropagation();
+      undoLastSeek();
+      return;
+    }
 
     if (settings.codeRewindBack === mouseCode && !isFeatureDisabled('rewind')) {
       e.preventDefault();
@@ -829,6 +1251,18 @@
       }
     }
 
+    // Отмена перемотки: перехватываем сочетание, только если есть что отменять.
+    // Иначе Ctrl+Z остаётся страничным (например, отмена ввода в текстовом поле).
+    if (undoState && !isFeatureDisabled('rewind') && matchesUndoCombo(e)) {
+      if (!isInputFocused() || isHoveringMediaOrPlayer()) {
+        e.preventDefault();
+        e.stopPropagation();
+        e.stopImmediatePropagation();
+        undoLastSeek();
+        return;
+      }
+    }
+
     if (isTimecodeInputActive) {
       if (e.key === 'Backspace') {
         e.preventDefault();
@@ -898,11 +1332,11 @@
 
       const frameStep = 1 / 30;
       if (isFrameBack) {
-        media.currentTime = Math.max(0, media.currentTime - frameStep);
+        seekTo(media, Math.max(0, media.currentTime - frameStep));
         showIndicator('Кадр назад');
       } else {
         const duration = getMediaDuration(media);
-        media.currentTime = Math.min(duration || Infinity, media.currentTime + frameStep);
+        seekTo(media, Math.min(duration || Infinity, media.currentTime + frameStep));
         showIndicator('Кадр вперед');
       }
       return;
@@ -990,10 +1424,10 @@
       const percent = digit * 10;
       const duration = getMediaDuration(media);
       if (duration > 0) {
-        media.currentTime = (duration * percent) / 100;
+        seekTo(media, (duration * percent) / 100);
         showIndicator(`Перемотано на ${percent}%`);
       } else if (media.duration && isFinite(media.duration)) {
-        media.currentTime = (media.duration * percent) / 100;
+        seekTo(media, (media.duration * percent) / 100);
         showIndicator(`Перемотано на ${percent}%`);
       }
       return;
