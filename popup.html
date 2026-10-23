@@ -22,11 +22,19 @@
       width: 350px;
       margin: 0;
       padding: 16px;
-      font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-family: var(--ui-font, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif);
       font-size: 13px;
       background: var(--bg);
       color: var(--text);
       box-sizing: border-box;
+    }
+
+    /* Когда выбран свой шрифт, он должен доходить и до кнопок, полей и списков */
+    html.has-ui-font button,
+    html.has-ui-font input,
+    html.has-ui-font select,
+    html.has-ui-font textarea {
+      font-family: inherit;
     }
 
     .header-bar {
@@ -231,6 +239,68 @@
     .key-input.recording {
       border-color: var(--accent) !important;
       background: rgba(59, 130, 246, 0.15) !important;
+    }
+
+    .key-number {
+      width: 120px !important;
+      text-align: center;
+      font-weight: bold;
+      font-size: 11px;
+    }
+
+    .hint {
+      margin-top: 6px;
+      font-size: 10px;
+      line-height: 1.4;
+      color: var(--text-muted);
+    }
+
+    .hint.error {
+      color: var(--danger);
+    }
+
+    .value-text {
+      color: var(--text-muted);
+      font-size: 12px;
+    }
+
+    .font-actions {
+      display: flex;
+      gap: 6px;
+      margin-top: 6px;
+    }
+
+    .mini-btn {
+      flex: 1;
+      padding: 7px 8px;
+      background: var(--input-bg);
+      border: 1px dashed var(--border);
+      color: var(--accent);
+      font-size: 11px;
+      font-weight: 600;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+
+    .mini-btn:hover:not(:disabled) {
+      background: var(--card-bg);
+      border-color: var(--accent);
+    }
+
+    .mini-btn.danger {
+      flex: 0 0 auto;
+      color: var(--danger);
+    }
+
+    .mini-btn.danger:hover:not(:disabled) {
+      border-color: var(--danger);
+    }
+
+    .mini-btn:disabled,
+    input[type="range"]:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
 
     .set-speed-box {
@@ -461,9 +531,18 @@
     <div class="set-speed-box">
       <label for="directSetSpeed">Установить текущую скорость:</label>
       <div style="display: flex; gap: 6px;">
-        <input type="number" id="directSetSpeed" step="0.01" placeholder="1.0">
+        <input type="number" id="directSetSpeed" step="0.1" min="0.1" max="16" placeholder="1.0">
         <button id="applyCurrentSpeedBtn" style="width: 70px; background: var(--accent); border: none; border-radius: 6px; color: white; cursor: pointer; font-weight: 600;">ОК</button>
       </div>
+    </div>
+
+    <div class="set-speed-box">
+      <div class="label-with-value">
+        <label for="volumeBoost">Усиление громкости:</label>
+        <span id="volumeBoostValue" class="value-text">100%</span>
+      </div>
+      <input type="range" id="volumeBoost" min="100" max="300" step="5" value="100" disabled>
+      <div id="volumeHint" class="hint">Ищу видео на странице…</div>
     </div>
 
     <label class="checkbox-field">
@@ -485,15 +564,9 @@
       <label for="step">Шаг изменения (колесо мыши):</label>
       <input type="number" id="step" step="0.01">
     </div>
-    <div class="row">
-      <div class="field">
-        <label for="minSpeed">Мин. скорость:</label>
-        <input type="number" id="minSpeed" step="0.01">
-      </div>
-      <div class="field">
-        <label for="maxSpeed">Макс. скорость:</label>
-        <input type="number" id="maxSpeed" step="0.01">
-      </div>
+    <div class="field">
+      <label for="resetSpeed">Скорость при сбросе (Ctrl + ЛКМ):</label>
+      <input type="number" id="resetSpeed" step="0.1" min="0.1" max="16">
     </div>
 
     <div class="row">
@@ -537,6 +610,14 @@
     <div class="key-bind">
       <span>Перемотка кадра вперёд</span>
       <input type="text" id="codeFrameForward" class="key-input" readonly>
+    </div>
+    <div class="key-bind">
+      <span>Отмена перемотки</span>
+      <input type="text" id="undoRewindCombo" class="key-input" readonly>
+    </div>
+    <div class="key-bind">
+      <span title="Сколько секунд после перемотки её можно отменить. 0 — отмена выключена">Время на отмену (сек)</span>
+      <input type="number" id="undoRewindDelaySec" class="key-number" min="0" max="30" step="0.5">
     </div>
 
     <div class="custom-binds-section">
@@ -583,6 +664,16 @@
     <div class="field">
       <label for="fontSize">Размер шрифта (px):</label>
       <input type="number" id="fontSize" min="8" max="60">
+    </div>
+    <div class="field">
+      <label for="fontFamily">Шрифт расширения:</label>
+      <select id="fontFamily"></select>
+      <div class="font-actions">
+        <button type="button" id="uploadFontBtn" class="mini-btn">Загрузить свой шрифт…</button>
+        <button type="button" id="deleteFontBtn" class="mini-btn danger" disabled>Удалить</button>
+      </div>
+      <input type="file" id="fontFileInput" accept=".ttf,.otf,.woff,.woff2" hidden>
+      <div id="fontHint" class="hint">TTF, OTF, WOFF или WOFF2, до 2 МБ. Шрифт применяется к этому меню и к плашкам на странице.</div>
     </div>
     <div class="field">
       <label for="posNormal">Позиция (Обычный режим):</label>
@@ -637,7 +728,7 @@
       <p><b>⚡ Управление скоростью:</b></p>
       <ul>
         <li><b>Ctrl + Колесо мыши:</b> плавное изменение скорости видео под курсором.</li>
-        <li><b>Ctrl + ЛКМ:</b> сброс скорости на 1.0x.</li>
+        <li><b>Ctrl + ЛКМ:</b> сброс скорости до значения из настроек (по умолчанию 1.0x).</li>
         <li><b>Ctrl + Shift + цифры:</b> прямое написание любой скорости (например, 2.5x).</li>
       </ul>
       <p><b>⏩ Перемотка:</b></p>
@@ -645,6 +736,12 @@
         <li><b>J / L:</b> быстрая перемотка назад / вперед на заданные секунды.</li>
         <li><b>&lt; / &gt; (Запятая / Точка):</b> покадровая перемотка назад и вперед.</li>
         <li><b>0-9:</b> переход к % видео (0 = 0%, 5 = 50%, 9 = 90%).</li>
+        <li><b>Ctrl + Z:</b> отмена перемотки, если нажать сразу после неё. Сочетание и время на отмену меняются на вкладке «Клавиши».</li>
+      </ul>
+      <p><b>🔊 Усиление громкости:</b></p>
+      <ul>
+        <li>Ползунок на вкладке «Основные» усиливает звук до 300% и запоминает значение для текущего сайта.</li>
+        <li>Если звук не усиливается, сайт защищает своё видео. Для отдельных сайтов усиление можно отключить в чёрном списке.</li>
       </ul>
       <p><b>⏱ Ввод таймкода:</b></p>
       <ul>
