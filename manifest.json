@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Overclock",
-  "version": "2.15",
+  "version": "3.0",
   "description": "Управление скоростью, перемоткой и таймкодами видео в один клик",
   "permissions": [
     "storage"
